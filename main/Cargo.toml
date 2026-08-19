@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ureq = { version = "2.10", features = ["json"] }
+ureq = { version = "3.4.0", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
+scrape-rs = { path = "../scrape-rs" }
 

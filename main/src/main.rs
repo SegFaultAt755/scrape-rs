@@ -1,11 +1,13 @@
-use std::thread;
-use std::thread::{sleep, JoinHandle};
-use std::time::Duration;
+use scrape_rs::fetch_link;
+use ureq::http::Method;
 
 
 fn main() {
-    let body = ureq::get("https://httpbin.io/json").call().unwrap().into_string().unwrap();
-
-    println!("body: {}", body);
-
+    let body = fetch_link(
+        "https://httpbin.io/post",
+        Method::POST,
+        Some("custname=Fedor&custtel=123&size=large&topping=cheese&delivery=18%3A00&comments=hi".into()),
+        Some("application/x-www-form-urlencoded"),
+    );
+    println!("{:?}", body);
 }

@@ -1,3 +1,5 @@
+pub mod parsers;
+
 use ureq::http::Method;
 
 pub fn fetch_link(

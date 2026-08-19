@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 ureq = "3.4.0"
+scraper = "0.20"

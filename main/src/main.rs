@@ -1,3 +1,4 @@
+use std::thread::spawn;
 use scrape_rs::fetch_link;
 use scrape_rs::parsers::{select_all, select_first, select_html};
 use ureq::http::Method;
@@ -21,16 +22,27 @@ fn parse_quotes(html: &str) -> Vec<Quote> {
 }
 
 fn main() {
-    let html = match fetch_link("https://quotes.toscrape.com", Method::GET, None, None) {
-        Ok(body) => body,
-        Err(e) => {
-            eprintln!("failed to fetch: {e}");
-            return;
-        }
-    };
+    println!("Multithread parsing\n\n\n\n");
 
-    let quotes = parse_quotes(&html);
-    for q in &quotes {
-        println!("{:?}", q);
+    let mut threads = Vec::new();
+    for i in 1..11{
+        let handle = spawn(move || {
+            fetch_link(format!("https://quotes.toscrape.com/page/{}", i).as_str(), Method::GET, None, None)
+
+        });
+        threads.push(handle);
     }
+
+
+    let mut results = Vec::new();
+    for handle in threads {
+        results.push(parse_quotes(handle.join().unwrap().unwrap().to_string().as_str()));
+    }
+
+    for page in results {
+        for quote in page {
+            println!("{:?}", quote);
+        }
+    }
+
 }

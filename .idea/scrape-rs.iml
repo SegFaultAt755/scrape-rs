@@ -2,10 +2,11 @@
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
-      <sourceFolder url="file://$MODULE_DIR$/main/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/scrape-rs/src" isTestSource="false" />
-      <excludeFolder url="file://$MODULE_DIR$/main/target" />
+      <sourceFolder url="file://$MODULE_DIR$/test/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/scrape-rs/target" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/test/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

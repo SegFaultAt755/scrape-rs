@@ -20,8 +20,5 @@ pub fn select_html(html: &str, selector: &str) -> Vec<String> {
     let Ok(selector) = Selector::parse(selector) else {
         return Vec::new();
     };
-    document
-        .select(&selector)
-        .map(|el| el.html())
-        .collect()
+    document.select(&selector).map(|el| el.html()).collect()
 }

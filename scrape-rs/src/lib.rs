@@ -3,7 +3,7 @@ pub mod structs;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use structs::{worker, Queue, ScrapeJob};
+use structs::{Queue, ScrapeJob, worker};
 use ureq::http::Method;
 
 /// Handle to a background fetch: call `fetch_many` and keep working.
@@ -78,7 +78,7 @@ pub fn fetch_many(urls: Vec<String>, num_threads: usize) -> FetchHandle {
         queue.push(ScrapeJob::new_indexed(url, index));
     }
 
-let results_outer = Arc::clone(&results);
+    let results_outer = Arc::clone(&results);
     let done_outer = Arc::clone(&done);
     thread::spawn(move || {
         let mut handles = Vec::new();
@@ -108,7 +108,11 @@ let results_outer = Arc::clone(&results);
         }
     });
 
-    FetchHandle { results, done, total }
+    FetchHandle {
+        results,
+        done,
+        total,
+    }
 }
 
 pub fn fetch_link(
@@ -144,5 +148,3 @@ fn send_body(
         None => builder.send_empty(),
     }
 }
-
-

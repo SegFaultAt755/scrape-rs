@@ -6,7 +6,7 @@ pub struct ScrapeJob {
     id: Uuid,
     url: String,
     status: JobStatus,
-    index: Option<usize>
+    index: Option<usize>,
 }
 
 impl ScrapeJob {
@@ -15,7 +15,7 @@ impl ScrapeJob {
             id: Uuid::new_v4(),
             url,
             status: JobStatus::Pending,
-            index: None
+            index: None,
         }
     }
 
@@ -24,36 +24,42 @@ impl ScrapeJob {
             id: Uuid::new_v4(),
             url,
             status: JobStatus::Pending,
-            index: Some(index)
+            index: Some(index),
         }
     }
 
-    pub fn url(&self) -> &str { &self.url }
-    pub fn status(&self) -> &JobStatus { &self.status }
-    pub fn index(&self) -> Option<usize> { self.index }
-    pub fn set_status(&mut self, status: JobStatus) { self.status = status; }
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn status(&self) -> &JobStatus {
+        &self.status
+    }
+    pub fn index(&self) -> Option<usize> {
+        self.index
+    }
+    pub fn set_status(&mut self, status: JobStatus) {
+        self.status = status;
+    }
 }
 
 pub struct Queue {
     jobs: Mutex<VecDeque<Option<ScrapeJob>>>,
-    avaliable: Condvar
+    avaliable: Condvar,
 }
 
 impl Queue {
     pub fn new() -> Self {
         Self {
             jobs: Mutex::new(VecDeque::new()),
-            avaliable: Condvar::new()
+            avaliable: Condvar::new(),
         }
     }
-
 
     pub fn push(&self, job: ScrapeJob) {
         let mut jobs = self.jobs.lock().unwrap();
         jobs.push_back(Some(job));
         self.avaliable.notify_one();
     }
-
 
     pub fn next(&self) -> Option<ScrapeJob> {
         let mut jobs = self.jobs.lock().unwrap();
@@ -76,7 +82,6 @@ impl Queue {
     }
 }
 
-
 pub fn worker(queue: Arc<Queue>, mut handler: impl FnMut(&mut ScrapeJob) + Send + 'static) {
     loop {
         match queue.next() {
@@ -95,5 +100,5 @@ pub enum JobStatus {
     Pending,
     Finished,
     Failed,
-    Waiting
+    Waiting,
 }

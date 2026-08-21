@@ -4,11 +4,15 @@
 
 ### A small, multithreaded web scraping library in Rust. It fetches web pages concurrently using a shared connection pool and provides simple CSS-selector-based HTML parsing
 
-<div>
+</div>
 
 ---
 
+<div align="center">
+
 # Features
+
+</div>
 
 - **Concurrent fetching** — `fetch_many` fetches a list of URLs on a configurable number of worker threads
 - **Incremental results** — process responses as soon as they arrive via `FetchHandle::ready_results`, or wait for everything with `wait()`
@@ -18,7 +22,11 @@
 
 ---
 
+<div align="center">
+
 # Usage
+
+</div>
 
 Add to your `Cargo.toml`:
 
@@ -27,7 +35,11 @@ Add to your `Cargo.toml`:
 scrape-rs = { path = "scrape-rs" }
 ```
 
+<div align="center">
+
 ## Fetch many URLs concurrently
+
+</div>
 
 ```rust
 use std::num::NonZeroUsize;
@@ -55,7 +67,11 @@ loop {
 }
 ```
 
+<div align="center">
+
 ## Parse HTML with CSS selectors
+
+</div>
 
 ```rust
 use scrape_rs::parsers::{select_html, select_all, select_first};
@@ -71,7 +87,11 @@ See the `test/` directory for a full working example.
 
 ---
 
+<div align="center">
+
 # Building & Testing
+
+</div>
 
 ```sh
 cargo test --workspace
@@ -81,6 +101,10 @@ Tests spin up a local HTTP server on `127.0.0.1` — no network access required.
 
 ---
 
+<div align="center">
+
 # License
+
+</div>
 
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later).

@@ -5,7 +5,6 @@ use thiserror::Error;
 use std::num::NonZeroUsize;
 
 pub struct ScrapeJob {
-    id: Uuid,
     url: String,
     status: JobStatus,
     index: Option<usize>,
@@ -14,7 +13,7 @@ pub struct ScrapeJob {
 impl ScrapeJob {
     pub fn new(url: String) -> Self {
         Self {
-            id: Uuid::new_v4(),
+
             url,
             status: JobStatus::Pending,
             index: None,
@@ -23,7 +22,7 @@ impl ScrapeJob {
 
     pub fn new_indexed(url: String, index: usize) -> Self {
         Self {
-            id: Uuid::new_v4(),
+
             url,
             status: JobStatus::Pending,
             index: Some(index),

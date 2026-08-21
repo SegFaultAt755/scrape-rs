@@ -5,10 +5,22 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 use structs::{Queue, ScrapeJob, worker};
 use ureq::Agent;
 use ureq::http::Method;
 use crate::structs::FetchError;
+
+/// Default timeout for all fetches via `fetch_many` / `fetch_link` (global).
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default agent: single `Agent` shared by all workers with `timeout_global = 5s`.
+pub fn default_agent() -> Agent {
+    Agent::config_builder()
+        .timeout_global(Some(DEFAULT_TIMEOUT))
+        .build()
+        .new_agent()
+}
 
 struct State {
     results: Vec<Option<Result<String, ureq::Error>>>,
@@ -86,7 +98,7 @@ impl FetchHandle {
 /// The result is collected through the handle.
 /// All workers share a single `ureq::Agent` (connection pool + cookies).
 pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchHandle, FetchError> {
-    let agent = Agent::new_with_defaults();
+    let agent = default_agent();
     fetch_many_with_agent(urls, num_threads, agent)
 }
 
@@ -164,7 +176,7 @@ pub fn fetch_link(
     body: Option<String>,
     content_type: Option<&str>,
 ) -> Result<String, ureq::Error> {
-    let agent = Agent::new_with_defaults();
+    let agent = default_agent();
     fetch_link_with_agent(&agent, url, method, body, content_type)
 }
 

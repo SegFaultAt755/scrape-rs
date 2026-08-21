@@ -1,10 +1,12 @@
 pub mod parsers;
 pub mod structs;
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use structs::{Queue, ScrapeJob, worker};
 use ureq::http::Method;
+use crate::structs::FetchError;
 
 /// Handle to a background fetch: call `fetch_many` and keep working.
 /// The result is collected via `wait()` (blocks until done) or `try_results()`.
@@ -66,7 +68,17 @@ impl FetchHandle {
 
 /// Fetches links in the background on `num_threads` threads and returns immediately.
 /// The result is collected through the handle.
-pub fn fetch_many(urls: Vec<String>, num_threads: usize) -> FetchHandle {
+pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchHandle, FetchError> {
+    let available = std::thread::available_parallelism()
+        .map_err(FetchError::ParallelismUnavailable)?;
+
+    if num_threads.get() > available.get() {
+        return Err(FetchError::TooManyThreads {
+            requested: num_threads,
+            available,
+        });
+    }
+
     let queue = Arc::new(Queue::new());
     let total = urls.len();
 
@@ -82,7 +94,7 @@ pub fn fetch_many(urls: Vec<String>, num_threads: usize) -> FetchHandle {
     let done_outer = Arc::clone(&done);
     thread::spawn(move || {
         let mut handles = Vec::new();
-        for _ in 0..num_threads {
+        for _ in 0..num_threads.into() {
             let queue = Arc::clone(&queue);
             let results = Arc::clone(&results_outer);
             let done = Arc::clone(&done_outer);
@@ -101,18 +113,18 @@ pub fn fetch_many(urls: Vec<String>, num_threads: usize) -> FetchHandle {
             }));
         }
 
-        queue.shutdown(num_threads);
+        queue.shutdown(usize::from(num_threads));
 
         for handle in handles {
             handle.join().unwrap();
         }
     });
 
-    FetchHandle {
+    Ok(FetchHandle {
         results,
         done,
         total,
-    }
+    })
 }
 
 pub fn fetch_link(

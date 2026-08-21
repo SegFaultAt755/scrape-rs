@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use scrape_rs::fetch_many;
 use scrape_rs::parsers::{select_all, select_first, select_html};
 
@@ -47,7 +48,7 @@ fn main() {
         .map(|i| format!("https://quotes.toscrape.com/page/{}", i))
         .collect();
 
-    let fetch_handle = fetch_many(urls, 2);
+    let fetch_handle = fetch_many(urls, NonZeroUsize::new(12).unwrap()).unwrap();
     println!("threads started");
 
     // Keep polling for partial results and parse them as soon as they arrive

@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use uuid::Uuid;
+use thiserror::Error;
+use std::num::NonZeroUsize;
 
 pub struct ScrapeJob {
     id: Uuid,
@@ -101,4 +103,18 @@ pub enum JobStatus {
     Finished,
     Failed,
     Waiting,
+}
+
+
+
+#[derive(Error, Debug)]
+pub enum FetchError {
+    #[error("Requested {requested} threads, but avaliable only {available}")]
+    TooManyThreads {
+        requested: NonZeroUsize,
+        available: NonZeroUsize,
+    },
+    #[error("Could not determine the number of available threads: {0}")]
+    ParallelismUnavailable(#[from] std::io::Error),
+    
 }

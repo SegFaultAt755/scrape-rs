@@ -1,7 +1,7 @@
-use std::num::NonZeroUsize;
-use std::thread::sleep;
 use scrape_rs::fetch_many;
 use scrape_rs::parsers::{select_all, select_first, select_html};
+use std::num::NonZeroUsize;
+use std::thread::sleep;
 
 #[derive(Debug)]
 struct Quote {
@@ -73,6 +73,4 @@ fn main() {
         // Avoid wasting CPU — short sleep between polls
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-
-
 }

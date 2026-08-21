@@ -1,6 +1,8 @@
 pub mod parsers;
 pub mod structs;
 
+use crate::structs::FetchError;
+use crate::structs::*;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,8 +11,6 @@ use std::time::Duration;
 use structs::{Queue, ScrapeJob, worker};
 use ureq::Agent;
 use ureq::http::Method;
-use crate::structs::FetchError;
-use crate::structs::{*};
 
 /// Default timeout for all fetches via `fetch_many` / `fetch_link` (global).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,8 +29,6 @@ struct State {
     ready: VecDeque<usize>,
 }
 
-
-
 /// Fetches links in the background on `num_threads` threads and returns immediately.
 /// The result is collected through the handle.
 /// All workers share a single `ureq::Agent` (connection pool + cookies).
@@ -46,8 +44,8 @@ pub fn fetch_many_with_agent(
     num_threads: NonZeroUsize,
     agent: Agent,
 ) -> Result<FetchHandle, FetchError> {
-    let available = std::thread::available_parallelism()
-        .map_err(FetchError::ParallelismUnavailable)?;
+    let available =
+        std::thread::available_parallelism().map_err(FetchError::ParallelismUnavailable)?;
 
     if num_threads.get() > available.get() {
         return Err(FetchError::TooManyThreads {
@@ -180,9 +178,7 @@ mod tests {
         {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             let addr = listener.local_addr().unwrap().to_string();
-            listener
-                .set_nonblocking(true)
-                .expect("set_nonblocking");
+            listener.set_nonblocking(true).expect("set_nonblocking");
             let handler = Arc::new(handler);
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_clone = Arc::clone(&shutdown);
@@ -228,10 +224,8 @@ mod tests {
         }
     }
 
-    fn handle_client<F>(
-        mut stream: TcpStream,
-        handler: &F,
-    ) where
+    fn handle_client<F>(mut stream: TcpStream, handler: &F)
+    where
         F: Fn(&str, &str, &str) -> (u16, String),
     {
         // Read request (simple, up to 16 KiB headers + body)
@@ -409,8 +403,9 @@ mod tests {
             (200, body)
         });
         let urls: Vec<String> = (0..5).map(|i| srv.url(&format!("/page/{i}"))).collect();
-        let handle = fetch_many_with_agent(urls.clone(), NonZeroUsize::new(2).unwrap(), fast_agent())
-            .unwrap();
+        let handle =
+            fetch_many_with_agent(urls.clone(), NonZeroUsize::new(2).unwrap(), fast_agent())
+                .unwrap();
 
         // poll ready_results until finished (also tests incremental API)
         let mut seen = 0;
@@ -454,7 +449,8 @@ mod tests {
     fn fetch_many_try_results_and_completed() {
         let srv = TestServer::spawn(|_, _, _| (200, "ok".to_string()));
         let urls: Vec<String> = (0..3).map(|i| srv.url(&format!("/{i}"))).collect();
-        let handle = fetch_many_with_agent(urls, NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
+        let handle =
+            fetch_many_with_agent(urls, NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
 
         // try_results should be None before completion (or eventually Some)
         // wait a bit to let workers start
@@ -496,8 +492,7 @@ mod tests {
             .new_agent();
         let urls = vec![srv.url("/fast"), srv.url("/slow")];
         let start = std::time::Instant::now();
-        let handle =
-            fetch_many_with_agent(urls, NonZeroUsize::new(2).unwrap(), agent).unwrap();
+        let handle = fetch_many_with_agent(urls, NonZeroUsize::new(2).unwrap(), agent).unwrap();
         let results = handle.wait();
         let elapsed = start.elapsed();
         assert_eq!(results.len(), 2);
@@ -505,7 +500,8 @@ mod tests {
         assert_eq!(results[0].as_ref().unwrap(), "fast");
         assert!(
             matches!(results[1].as_ref().unwrap_err(), ureq::Error::Timeout(_)),
-            "second should timeout, got {:?}", results[1]
+            "second should timeout, got {:?}",
+            results[1]
         );
         // Whole batch must finish ~350ms, not 2s
         assert!(
@@ -546,7 +542,10 @@ mod tests {
             Ok(_) => panic!("expected TooManyThreads error"),
             Err(e) => e,
         };
-        assert!(matches!(err, crate::structs::FetchError::TooManyThreads { .. }));
+        assert!(matches!(
+            err,
+            crate::structs::FetchError::TooManyThreads { .. }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -574,7 +573,8 @@ mod tests {
             let html = r#"<div class="quote"><span class="text">Hello</span><span class="author">World</span></div>"#;
             (200, html.to_string())
         });
-        let html = fetch_link_with_agent(&fast_agent(), &srv.url("/"), Method::GET, None, None).unwrap();
+        let html =
+            fetch_link_with_agent(&fast_agent(), &srv.url("/"), Method::GET, None, None).unwrap();
         let quotes = crate::parsers::select_html(&html, ".quote");
         assert_eq!(quotes.len(), 1);
     }

@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
-use uuid::Uuid;
-use thiserror::Error;
-use std::num::NonZeroUsize;
 use crate::State;
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Condvar, Mutex};
+use thiserror::Error;
+use uuid::Uuid;
 
 pub struct ScrapeJob {
     url: String,
@@ -14,7 +14,6 @@ pub struct ScrapeJob {
 impl ScrapeJob {
     pub fn new(url: String) -> Self {
         Self {
-
             url,
             status: JobStatus::Pending,
             index: None,
@@ -23,7 +22,6 @@ impl ScrapeJob {
 
     pub fn new_indexed(url: String, index: usize) -> Self {
         Self {
-
             url,
             status: JobStatus::Pending,
             index: Some(index),
@@ -105,8 +103,6 @@ pub enum JobStatus {
     Waiting,
 }
 
-
-
 #[derive(Error, Debug)]
 pub enum FetchError {
     #[error("Requested {requested} threads, but avaliable only {available}")]
@@ -116,7 +112,6 @@ pub enum FetchError {
     },
     #[error("Could not determine the number of available threads: {0}")]
     ParallelismUnavailable(#[from] std::io::Error),
-    
 }
 
 /// Handle to a background fetch: call `fetch_many` and keep working.
@@ -184,4 +179,3 @@ impl FetchHandle {
         results.into_iter().map(|r| r.unwrap()).collect()
     }
 }
-

@@ -1,25 +1,33 @@
 pub mod parsers;
 pub mod structs;
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use structs::{Queue, ScrapeJob, worker};
+use ureq::Agent;
 use ureq::http::Method;
 use crate::structs::FetchError;
+
+struct State {
+    results: Vec<Option<Result<String, ureq::Error>>>,
+    completed: usize,
+    ready: VecDeque<usize>,
+}
 
 /// Handle to a background fetch: call `fetch_many` and keep working.
 /// The result is collected via `wait()` (blocks until done) or `try_results()`.
 pub struct FetchHandle {
-    results: Arc<Mutex<Vec<Option<Result<String, ureq::Error>>>>>,
-    done: Arc<(Mutex<usize>, Condvar)>,
+    state: Arc<(Mutex<State>, Condvar)>,
     total: usize,
 }
 
 impl FetchHandle {
     /// true if all tasks have finished
     pub fn is_finished(&self) -> bool {
-        *self.done.0.lock().unwrap() >= self.total
+        let (lock, _) = &*self.state;
+        lock.lock().unwrap().completed >= self.total
     }
 
     /// Returns results if everything is ready, otherwise None (does not block)
@@ -32,17 +40,21 @@ impl FetchHandle {
 
     /// How many tasks have finished already (does not block)
     pub fn completed(&self) -> usize {
-        *self.done.0.lock().unwrap()
+        let (lock, _) = &*self.state;
+        lock.lock().unwrap().completed
     }
 
     /// Takes and returns the already-completed results (as they arrive).
-    /// Each completed result is returned exactly once — a worker fills the slot,
-    /// and this method takes it. Does not block.
+    /// Each completed result is returned exactly once — O(1) queue drain, not O(n) scan.
     pub fn ready_results(&self) -> Vec<(usize, Result<String, ureq::Error>)> {
-        let mut results = self.results.lock().unwrap();
-        let mut out = Vec::new();
-        for (index, slot) in results.iter_mut().enumerate() {
-            if let Some(res) = slot.take() {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        // O(1) swap of the ready queue; no scan over `results` (O(n)) any more
+        let ready_indices = std::mem::take(&mut state.ready);
+        let mut out = Vec::with_capacity(ready_indices.len());
+        for index in ready_indices {
+            // each ready index is guaranteed to have Some result
+            if let Some(res) = state.results[index].take() {
                 out.push((index, res));
             }
         }
@@ -51,24 +63,40 @@ impl FetchHandle {
 
     /// Blocks until all tasks finish and returns the results in original order
     pub fn wait(&self) -> Vec<Result<String, ureq::Error>> {
-        let (lock, cvar) = &*self.done;
-        let mut done = lock.lock().unwrap();
-        while *done < self.total {
-            done = cvar.wait(done).unwrap();
+        let (lock, cvar) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        while state.completed < self.total {
+            state = cvar.wait(state).unwrap();
         }
+        drop(state);
         self.collect()
     }
 
     fn collect(&self) -> Vec<Result<String, ureq::Error>> {
-        let mut results = self.results.lock().unwrap();
-        let results = std::mem::take(&mut *results);
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        // Clear ready since we drain everything in order
+        state.ready.clear();
+        let results = std::mem::take(&mut state.results);
         results.into_iter().map(|r| r.unwrap()).collect()
     }
 }
 
 /// Fetches links in the background on `num_threads` threads and returns immediately.
 /// The result is collected through the handle.
+/// All workers share a single `ureq::Agent` (connection pool + cookies).
 pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchHandle, FetchError> {
+    let agent = Agent::new_with_defaults();
+    fetch_many_with_agent(urls, num_threads, agent)
+}
+
+/// Same as `fetch_many`, but uses a caller-provided `Agent`.
+/// Allows custom TLS/proxy/config while still sharing one pool across all workers.
+pub fn fetch_many_with_agent(
+    urls: Vec<String>,
+    num_threads: NonZeroUsize,
+    agent: Agent,
+) -> Result<FetchHandle, FetchError> {
     let available = std::thread::available_parallelism()
         .map_err(FetchError::ParallelismUnavailable)?;
 
@@ -82,32 +110,36 @@ pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchH
     let queue = Arc::new(Queue::new());
     let total = urls.len();
 
-    let results: Arc<Mutex<Vec<Option<Result<String, ureq::Error>>>>> =
-        Arc::new(Mutex::new((0..total).map(|_| None).collect()));
-    let done: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let state: Arc<(Mutex<State>, Condvar)> = Arc::new((
+        Mutex::new(State {
+            results: (0..total).map(|_| None).collect(),
+            completed: 0,
+            ready: VecDeque::new(),
+        }),
+        Condvar::new(),
+    ));
 
     for (index, url) in urls.into_iter().enumerate() {
         queue.push(ScrapeJob::new_indexed(url, index));
     }
 
-    let results_outer = Arc::clone(&results);
-    let done_outer = Arc::clone(&done);
+    let state_outer = Arc::clone(&state);
     thread::spawn(move || {
         let mut handles = Vec::new();
         for _ in 0..num_threads.into() {
             let queue = Arc::clone(&queue);
-            let results = Arc::clone(&results_outer);
-            let done = Arc::clone(&done_outer);
+            let state = Arc::clone(&state_outer);
+            let agent = agent.clone();
             handles.push(thread::spawn(move || {
                 worker(queue, move |job| {
                     let index = job.index().unwrap();
-                    let res = fetch_link(job.url(), Method::GET, None, None);
-                    let mut results = results.lock().unwrap();
-                    results[index] = Some(res);
-                    drop(results);
-                    let (lock, cvar) = &*done;
-                    let mut count = lock.lock().unwrap();
-                    *count += 1;
+                    let res = fetch_link_with_agent(&agent, job.url(), Method::GET, None, None);
+                    let (lock, cvar) = &*state;
+                    let mut guard = lock.lock().unwrap();
+                    guard.results[index] = Some(res);
+                    guard.completed += 1;
+                    guard.ready.push_back(index);
+                    drop(guard);
                     cvar.notify_all();
                 });
             }));
@@ -120,27 +152,38 @@ pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchH
         }
     });
 
-    Ok(FetchHandle {
-        results,
-        done,
-        total,
-    })
+    Ok(FetchHandle { state, total })
 }
 
+/// Fetch a single URL using the shared-agent pattern.
+/// This is a convenience wrapper that creates a one-off agent. Prefer
+/// `fetch_link_with_agent` when you already have an `Agent`.
 pub fn fetch_link(
     url: &str,
     method: Method,
     body: Option<String>,
     content_type: Option<&str>,
 ) -> Result<String, ureq::Error> {
+    let agent = Agent::new_with_defaults();
+    fetch_link_with_agent(&agent, url, method, body, content_type)
+}
+
+/// Fetch a single URL using an explicit `Agent` (shared pool).
+pub fn fetch_link_with_agent(
+    agent: &Agent,
+    url: &str,
+    method: Method,
+    body: Option<String>,
+    content_type: Option<&str>,
+) -> Result<String, ureq::Error> {
     let response = match method {
-        Method::GET => ureq::get(url).call()?,
-        Method::DELETE => ureq::delete(url).call()?,
-        Method::HEAD => ureq::head(url).call()?,
-        Method::OPTIONS => ureq::options(url).call()?,
-        Method::POST => send_body(ureq::post(url), body.as_deref(), content_type)?,
-        Method::PUT => send_body(ureq::put(url), body.as_deref(), content_type)?,
-        Method::PATCH => send_body(ureq::patch(url), body.as_deref(), content_type)?,
+        Method::GET => agent.get(url).call()?,
+        Method::DELETE => agent.delete(url).call()?,
+        Method::HEAD => agent.head(url).call()?,
+        Method::OPTIONS => agent.options(url).call()?,
+        Method::POST => send_body(agent.post(url), body.as_deref(), content_type)?,
+        Method::PUT => send_body(agent.put(url), body.as_deref(), content_type)?,
+        Method::PATCH => send_body(agent.patch(url), body.as_deref(), content_type)?,
         _ => return Err(ureq::Error::StatusCode(405)),
     };
     Ok(response.into_body().read_to_string()?)

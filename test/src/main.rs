@@ -48,7 +48,7 @@ fn main() {
         .map(|i| format!("https://quotes.toscrape.com/page/{}", i))
         .collect();
 
-    let fetch_handle = fetch_many(urls, NonZeroUsize::new(12).unwrap()).unwrap();
+    let fetch_handle = fetch_many(urls, NonZeroUsize::new(1).unwrap()).unwrap();
     println!("threads started");
 
     // Keep polling for partial results and parse them as soon as they arrive
@@ -70,6 +70,6 @@ fn main() {
         }
 
         // Avoid wasting CPU — short sleep between polls
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }

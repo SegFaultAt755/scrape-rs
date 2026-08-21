@@ -15,7 +15,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Verify package layout and build
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run -p scrape-rs
 
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish --token ${{ secrets.CRATES_TOKEN }} -p scrape-rs

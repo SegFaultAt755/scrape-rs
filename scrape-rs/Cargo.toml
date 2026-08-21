@@ -3,6 +3,9 @@ name = "scrape-rs"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
+description = "A small multithreaded web scraping library: concurrent fetching with a shared connection pool and CSS-selector HTML parsing."
+readme = "../README.md"
+repository = "https://github.com/amogus-gggy/scrape-rs"
 
 [dependencies]
 ureq = { version = "3.4.0", features = ["charset"] }

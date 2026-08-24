@@ -1,18 +1,20 @@
 pub mod parsers;
 pub mod structs;
 
-use crate::structs::FetchError;
+use crate::structs::{FetchError, FetchLinkError, recover_lock};
 use crate::structs::*;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use structs::{Queue, ScrapeJob, worker};
 use ureq::Agent;
 use ureq::http::Method;
 
-/// Default timeout for all fetches via `fetch_many` / `fetch_link` (global).
+/// Default timeout for all fetches via `init_worker_pool` / `fetch_link` (global).
+/// Applied even when a caller-provided `Agent` has no timeout configured,
+/// so a silent server can never hang a worker forever.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default agent: single `Agent` shared by all workers with `timeout_global = 5s`.
@@ -23,27 +25,42 @@ pub fn default_agent() -> Agent {
         .new_agent()
 }
 
-struct State {
-    results: Vec<Option<Result<String, ureq::Error>>>,
+pub(crate) struct State {
+    results: Vec<Option<Result<String, FetchLinkError>>>,
     completed: usize,
+    total: usize,
     ready: VecDeque<usize>,
 }
 
-/// Fetches links in the background on `num_threads` threads and returns immediately.
-/// The result is collected through the handle.
-/// All workers share a single `ureq::Agent` (connection pool + cookies).
-pub fn fetch_many(urls: Vec<String>, num_threads: NonZeroUsize) -> Result<FetchHandle, FetchError> {
-    let agent = default_agent();
-    fetch_many_with_agent(urls, num_threads, agent)
+impl State {
+    fn new() -> Self {
+        State {
+            results: Vec::new(),
+            completed: 0,
+            total: 0,
+            ready: VecDeque::new(),
+        }
+    }
 }
 
-/// Same as `fetch_many`, but uses a caller-provided `Agent`.
+/// Initializes a worker pool of `num_threads` background fetchers.
+///
+/// Returns a [`WorkerPool`] that owns the queue and the worker threads. Push
+/// URLs into `pool.queue` (or via [`WorkerPool::push`]) at any time, then read
+/// results through the [`FetchHandle`] obtained from [`WorkerPool::handle`].
+/// Call [`WorkerPool::close`] once no more URLs will be pushed so the workers
+/// can exit. All workers share a single `ureq::Agent` (connection pool + cookies).
+pub fn init_worker_pool(num_threads: NonZeroUsize) -> Result<WorkerPool, FetchError> {
+    let agent = default_agent();
+    init_worker_pool_with_agent(num_threads, agent)
+}
+
+/// Same as `init_worker_pool`, but uses a caller-provided `Agent`.
 /// Allows custom TLS/proxy/config while still sharing one pool across all workers.
-pub fn fetch_many_with_agent(
-    urls: Vec<String>,
+pub fn init_worker_pool_with_agent(
     num_threads: NonZeroUsize,
     agent: Agent,
-) -> Result<FetchHandle, FetchError> {
+) -> Result<WorkerPool, FetchError> {
     let available =
         std::thread::available_parallelism().map_err(FetchError::ParallelismUnavailable)?;
 
@@ -55,51 +72,132 @@ pub fn fetch_many_with_agent(
     }
 
     let queue = Arc::new(Queue::new());
-    let total = urls.len();
+    let state: Arc<(Mutex<State>, Condvar)> =
+        Arc::new((Mutex::new(State::new()), Condvar::new()));
 
-    let state: Arc<(Mutex<State>, Condvar)> = Arc::new((
-        Mutex::new(State {
-            results: (0..total).map(|_| None).collect(),
-            completed: 0,
-            ready: VecDeque::new(),
-        }),
-        Condvar::new(),
-    ));
-
-    for (index, url) in urls.into_iter().enumerate() {
-        queue.push(ScrapeJob::new_indexed(url, index));
+    let mut workers = Vec::with_capacity(num_threads.get());
+    for _ in 0..num_threads.get() {
+        let queue = Arc::clone(&queue);
+        let state = Arc::clone(&state);
+        let agent = agent.clone();
+        workers.push(thread::spawn(move || {
+            worker(queue, move |job| {
+                let Some(index) = job.index() else {
+                    return false;
+                };
+                // A panic inside the fetch must not kill the counter:
+                // record it as a failed result so `wait()` can finish.
+                let res = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_link_with_agent(&agent, job.url(), Method::GET, None, None)
+                })) {
+                    Ok(res) => res,
+                    Err(_) => Err(FetchLinkError::WorkerPanic),
+                };
+                let ok = res.is_ok();
+                let (lock, cvar) = &*state;
+                let mut guard = recover_lock(lock);
+                guard.results[index] = Some(res);
+                guard.completed += 1;
+                guard.ready.push_back(index);
+                drop(guard);
+                cvar.notify_all();
+                ok
+            });
+        }));
     }
 
-    let state_outer = Arc::clone(&state);
-    thread::spawn(move || {
-        let mut handles = Vec::new();
-        for _ in 0..num_threads.into() {
-            let queue = Arc::clone(&queue);
-            let state = Arc::clone(&state_outer);
-            let agent = agent.clone();
-            handles.push(thread::spawn(move || {
-                worker(queue, move |job| {
-                    let index = job.index().unwrap();
-                    let res = fetch_link_with_agent(&agent, job.url(), Method::GET, None, None);
-                    let (lock, cvar) = &*state;
-                    let mut guard = lock.lock().unwrap();
-                    guard.results[index] = Some(res);
-                    guard.completed += 1;
-                    guard.ready.push_back(index);
-                    drop(guard);
-                    cvar.notify_all();
-                });
-            }));
+    Ok(WorkerPool {
+        queue: FetchQueue {
+            queue,
+            state: Arc::clone(&state),
+        },
+        state,
+        workers,
+        closed: false,
+    })
+}
+
+/// A queue of URLs to be fetched by a [`WorkerPool`].
+///
+/// Each `push` is assigned a stable index so results come back in the order
+/// they were enqueued. The pool keeps running until [`WorkerPool::close`],
+/// so URLs may be added incrementally.
+pub struct FetchQueue {
+    queue: Arc<Queue>,
+    state: Arc<(Mutex<State>, Condvar)>,
+}
+
+impl FetchQueue {
+    /// Enqueue `url` for fetching. Returns the index used to order the result.
+    pub fn push(&self, url: String) -> usize {
+        let (lock, cvar) = &*self.state;
+        let mut state = recover_lock(lock);
+        let index = state.results.len();
+        state.results.push(None);
+        state.total += 1;
+        drop(state);
+        // Wake any `wait()` that might otherwise miss the new `total`.
+        cvar.notify_all();
+        self.queue.push(ScrapeJob::new_indexed(url, index));
+        index
+    }
+}
+
+/// A background worker pool: owns the queue, the shared agent, and the threads.
+/// Push URLs via [`WorkerPool::queue`] (or [`WorkerPool::push`]) and collect
+/// them with the [`FetchHandle`] from [`WorkerPool::handle`]. Call
+/// [`WorkerPool::close`] when done to shut the workers down.
+pub struct WorkerPool {
+    pub queue: FetchQueue,
+    state: Arc<(Mutex<State>, Condvar)>,
+    workers: Vec<JoinHandle<()>>,
+    closed: bool,
+}
+
+impl WorkerPool {
+    /// Enqueue `url` for fetching. See [`FetchQueue::push`].
+    pub fn push(&self, url: String) -> usize {
+        self.queue.push(url)
+    }
+
+    /// Obtain a handle to read results for URLs pushed so far.
+    pub fn handle(&self) -> FetchHandle {
+        FetchHandle {
+            state: Arc::clone(&self.state),
         }
+    }
 
-        queue.shutdown(usize::from(num_threads));
+    /// Signal that no more URLs will be pushed. This is non-blocking: the
+    /// workers keep draining any already-queued URLs and then exit on their
+    /// own — they are *not* killed mid-fetch. Results remain readable through
+    /// the [`FetchHandle`] regardless. Calling `close` (or dropping the pool)
+    /// is only needed so the worker threads can terminate instead of idling
+    /// forever; it does not affect already-submitted work.
+    pub fn close(mut self) {
+        self.shutdown();
+    }
+}
 
-        for handle in handles {
-            handle.join().unwrap();
+impl WorkerPool {
+    fn shutdown(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            // Push one `None` per worker so each `queue.next()` returns and the
+            // worker loop ends — after it has processed every real job ahead of
+            // the marker in the queue.
+            self.queue.queue.shutdown(self.workers.len());
         }
-    });
+    }
+}
 
-    Ok(FetchHandle { state, total })
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // If the caller never called `close`, still let the workers drain and
+        // exit instead of blocking on the queue forever. Detached threads keep
+        // running until their queued work is done; the shared `state` (held
+        // independently by every `FetchHandle`) outlives them.
+        self.shutdown();
+    }
 }
 
 /// Fetch a single URL using the shared-agent pattern.
@@ -110,30 +208,54 @@ pub fn fetch_link(
     method: Method,
     body: Option<String>,
     content_type: Option<&str>,
-) -> Result<String, ureq::Error> {
+) -> Result<String, FetchLinkError> {
     let agent = default_agent();
     fetch_link_with_agent(&agent, url, method, body, content_type)
 }
 
 /// Fetch a single URL using an explicit `Agent` (shared pool).
+///
+/// A per-request `DEFAULT_TIMEOUT` is always applied on top of the agent
+/// config, so an `Agent` without any timeout configured still cannot hang.
 pub fn fetch_link_with_agent(
     agent: &Agent,
     url: &str,
     method: Method,
     body: Option<String>,
     content_type: Option<&str>,
-) -> Result<String, ureq::Error> {
+) -> Result<String, FetchLinkError> {
     let response = match method {
-        Method::GET => agent.get(url).call()?,
-        Method::DELETE => agent.delete(url).call()?,
-        Method::HEAD => agent.head(url).call()?,
-        Method::OPTIONS => agent.options(url).call()?,
-        Method::POST => send_body(agent.post(url), body.as_deref(), content_type)?,
-        Method::PUT => send_body(agent.put(url), body.as_deref(), content_type)?,
-        Method::PATCH => send_body(agent.patch(url), body.as_deref(), content_type)?,
-        _ => return Err(ureq::Error::StatusCode(405)),
+        Method::GET => with_timeout(agent, agent.get(url)).call()?,
+        Method::DELETE => with_timeout(agent, agent.delete(url)).call()?,
+        Method::HEAD => with_timeout(agent, agent.head(url)).call()?,
+        Method::OPTIONS => with_timeout(agent, agent.options(url)).call()?,
+        Method::POST => {
+            send_body(with_timeout(agent, agent.post(url)), body.as_deref(), content_type)?
+        }
+        Method::PUT => send_body(with_timeout(agent, agent.put(url)), body.as_deref(), content_type)?,
+        Method::PATCH => {
+            send_body(with_timeout(agent, agent.patch(url)), body.as_deref(), content_type)?
+        }
+        // The library does not implement this method — report it clearly,
+        // do not fake an HTTP 405 as if it came from the server.
+        _ => return Err(FetchLinkError::UnsupportedMethod(method)),
     };
     Ok(response.into_body().read_to_string()?)
+}
+
+/// Bound the request end-to-end by `DEFAULT_TIMEOUT`.
+/// If the agent already has a shorter global timeout configured, the stricter
+/// one wins; an agent without any timeout still gets `DEFAULT_TIMEOUT`, so a
+/// silently-hanging server can never block a call forever.
+fn with_timeout<S>(
+    agent: &Agent,
+    builder: ureq::RequestBuilder<S>,
+) -> ureq::RequestBuilder<S> {
+    let effective = match agent.config().timeouts().global {
+        Some(configured) if configured < DEFAULT_TIMEOUT => Some(configured),
+        _ => Some(DEFAULT_TIMEOUT),
+    };
+    builder.config().timeout_global(effective).build()
 }
 
 fn send_body(
@@ -154,6 +276,7 @@ fn send_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::FetchLinkError;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -349,7 +472,7 @@ mod tests {
             .expect_err("should timeout");
         let elapsed = start.elapsed();
         assert!(
-            matches!(err, ureq::Error::Timeout(_)),
+            matches!(err, FetchLinkError::Http(ureq::Error::Timeout(_))),
             "expected Timeout, got {err:?}"
         );
         // Must timeout quickly (~400ms), not wait for full 2s server delay
@@ -389,23 +512,76 @@ mod tests {
         let err =
             fetch_link_with_agent(&fast_agent(), &srv.url("/missing"), Method::GET, None, None)
                 .unwrap_err();
-        assert!(matches!(err, ureq::Error::StatusCode(404)));
+        assert!(matches!(
+            err,
+            FetchLinkError::Http(ureq::Error::StatusCode(404))
+        ));
+    }
+
+    #[test]
+    fn fetch_link_unsupported_method_is_explicit() {
+        let srv = TestServer::spawn(|_, _, _| (200, "ok".to_string()));
+        let err = fetch_link_with_agent(&fast_agent(), &srv.url("/"), Method::TRACE, None, None)
+            .unwrap_err();
+        match err {
+            FetchLinkError::UnsupportedMethod(ref m) => {
+                assert_eq!(*m, Method::TRACE);
+                // The message must say the method is not implemented here,
+                // not pretend the server rejected it.
+                let msg = err.to_string();
+                assert!(msg.contains("not implemented in scrape-rs"), "{msg}");
+            }
+            other => panic!("expected UnsupportedMethod, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_link_timeout_applied_to_agent_without_timeout() {
+        // An agent configured WITHOUT any timeout must still be bounded
+        // by the per-request DEFAULT_TIMEOUT applied inside the library.
+        let srv = TestServer::spawn(|_, path, _| {
+            if path == "/hang" {
+                thread::sleep(Duration::from_secs(30));
+            }
+            (200, "never".to_string())
+        });
+        let no_timeout_agent = Agent::config_builder().build().new_agent();
+        let start = std::time::Instant::now();
+        let err =
+            fetch_link_with_agent(&no_timeout_agent, &srv.url("/hang"), Method::GET, None, None)
+                .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, FetchLinkError::Http(ureq::Error::Timeout(_))),
+            "expected Timeout, got {err:?}"
+        );
+        // Must bail out around DEFAULT_TIMEOUT (5s), not hang for 30s+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "unconfigured agent should still time out at ~5s, got {elapsed:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
-    // fetch_many tests
+    // worker pool tests
     // -------------------------------------------------------------------------
     #[test]
-    fn fetch_many_success_ordered() {
+    fn worker_pool_success_ordered() {
         let srv = TestServer::spawn(|_, path, _| {
             // path like /page/1 -> return page-1
             let body = format!("body for {path}");
             (200, body)
         });
         let urls: Vec<String> = (0..5).map(|i| srv.url(&format!("/page/{i}"))).collect();
-        let handle =
-            fetch_many_with_agent(urls.clone(), NonZeroUsize::new(2).unwrap(), fast_agent())
-                .unwrap();
+        let pool = init_worker_pool_with_agent(
+            NonZeroUsize::new(2).unwrap(),
+            fast_agent(),
+        )
+        .unwrap();
+        let handle = pool.handle();
+        for url in urls {
+            pool.push(url);
+        }
 
         // poll ready_results until finished (also tests incremental API)
         let mut seen = 0;
@@ -424,33 +600,41 @@ mod tests {
         assert_eq!(seen, 5);
 
         // wait() must return ordered results
-        // need a fresh handle since previous was consumed via ready_results
+        // need a fresh pool since previous was consumed via ready_results
         // Use a fresh server + fresh agent to avoid pooled-connection RST on Windows
         let srv2 = TestServer::spawn(|_, path, _| {
             let body = format!("body for {path}");
             (200, body)
         });
         let urls2: Vec<String> = (0..5).map(|i| srv2.url(&format!("/page/{i}"))).collect();
-        let handle2 =
-            fetch_many_with_agent(urls2, NonZeroUsize::new(2).unwrap(), fast_agent()).unwrap();
+        let pool2 =
+            init_worker_pool_with_agent(NonZeroUsize::new(2).unwrap(), fast_agent()).unwrap();
+        let handle2 = pool2.handle();
+        for url in urls2 {
+            pool2.push(url);
+        }
         let results = handle2.wait();
+        pool2.close();
         assert_eq!(results.len(), 5);
         for (i, r) in results.into_iter().enumerate() {
             // Allow transient connection resets to be retried — treat as flake, unwrap with context
             assert!(
                 r.is_ok(),
-                "fetch_many ordered second batch failed at {i}: {r:?}"
+                "worker pool ordered second batch failed at {i}: {r:?}"
             );
             assert_eq!(r.unwrap(), format!("body for /page/{i}"));
         }
     }
 
     #[test]
-    fn fetch_many_try_results_and_completed() {
+    fn worker_pool_try_results_and_completed() {
         let srv = TestServer::spawn(|_, _, _| (200, "ok".to_string()));
-        let urls: Vec<String> = (0..3).map(|i| srv.url(&format!("/{i}"))).collect();
-        let handle =
-            fetch_many_with_agent(urls, NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
+        let pool =
+            init_worker_pool_with_agent(NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
+        let handle = pool.handle();
+        for i in 0..3 {
+            pool.push(srv.url(&format!("/{i}")));
+        }
 
         // try_results should be None before completion (or eventually Some)
         // wait a bit to let workers start
@@ -462,22 +646,29 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert!(handle.is_finished());
         assert_eq!(handle.completed(), 3);
+        pool.close();
+
         // try_results now returns Some
         // Note: wait() already consumed results via collect(), so try_results would be empty
         // but is_finished remains true. We test a new handle for try_results path.
-        let urls2: Vec<String> = (0..2).map(|i| srv.url(&format!("/t/{i}"))).collect();
-        let h2 = fetch_many_with_agent(urls2, NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
+        let pool2 =
+            init_worker_pool_with_agent(NonZeroUsize::new(1).unwrap(), fast_agent()).unwrap();
+        let handle2 = pool2.handle();
+        for i in 0..2 {
+            pool2.push(srv.url(&format!("/t/{i}")));
+        }
         // spin until finished then try_results
-        while !h2.is_finished() {
+        while !handle2.is_finished() {
             thread::sleep(Duration::from_millis(5));
         }
-        let opt = h2.try_results();
+        let opt = handle2.try_results();
         assert!(opt.is_some());
         assert_eq!(opt.unwrap().len(), 2);
+        pool2.close();
     }
 
     #[test]
-    fn fetch_many_timeout_mixed() {
+    fn worker_pool_timeout_mixed() {
         let srv = TestServer::spawn(|_, path, _| {
             if path.contains("slow") {
                 thread::sleep(Duration::from_secs(2));
@@ -490,16 +681,22 @@ mod tests {
             .timeout_global(Some(Duration::from_millis(350)))
             .build()
             .new_agent();
-        let urls = vec![srv.url("/fast"), srv.url("/slow")];
+        let pool = init_worker_pool_with_agent(NonZeroUsize::new(2).unwrap(), agent).unwrap();
+        let handle = pool.handle();
+        pool.push(srv.url("/fast"));
+        pool.push(srv.url("/slow"));
         let start = std::time::Instant::now();
-        let handle = fetch_many_with_agent(urls, NonZeroUsize::new(2).unwrap(), agent).unwrap();
         let results = handle.wait();
+        pool.close();
         let elapsed = start.elapsed();
         assert_eq!(results.len(), 2);
         // fast should succeed, slow should timeout (order preserved)
         assert_eq!(results[0].as_ref().unwrap(), "fast");
         assert!(
-            matches!(results[1].as_ref().unwrap_err(), ureq::Error::Timeout(_)),
+            matches!(
+                results[1].as_ref().unwrap_err(),
+                FetchLinkError::Http(ureq::Error::Timeout(_))
+            ),
             "second should timeout, got {:?}",
             results[1]
         );
@@ -511,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_many_default_timeout() {
+    fn worker_pool_default_timeout() {
         // default timeout is 5s — a 800ms delay must succeed with default agent
         let srv = TestServer::spawn(|_, path, _| {
             if path == "/delay1" {
@@ -521,10 +718,12 @@ mod tests {
                 (200, "ok".to_string())
             }
         });
-        let urls = vec![srv.url("/delay1")];
+        let pool = init_worker_pool(NonZeroUsize::new(1).unwrap()).unwrap();
+        let handle = pool.handle();
+        pool.push(srv.url("/delay1"));
         let start = std::time::Instant::now();
-        let handle = fetch_many(urls, NonZeroUsize::new(1).unwrap()).unwrap();
         let results = handle.wait();
+        pool.close();
         let elapsed = start.elapsed();
         assert_eq!(results[0].as_ref().unwrap(), "delayed ok");
         // Should take ~800ms (the server delay) and be well below 5s default
@@ -535,10 +734,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_many_too_many_threads() {
+    fn worker_pool_too_many_threads() {
         let available = thread::available_parallelism().unwrap();
         let too_many = NonZeroUsize::new(available.get() + 1).unwrap();
-        let err = match fetch_many(vec!["http://example.com".to_string()], too_many) {
+        let err = match init_worker_pool(too_many) {
             Ok(_) => panic!("expected TooManyThreads error"),
             Err(e) => e,
         };
@@ -546,6 +745,30 @@ mod tests {
             err,
             crate::structs::FetchError::TooManyThreads { .. }
         ));
+    }
+
+    #[test]
+    fn worker_pool_incremental_push() {
+        // URLs may be pushed after the handle is obtained and even after some
+        // results have already arrived — the pool keeps running until close().
+        let srv = TestServer::spawn(|_, path, _| {
+            let body = format!("body for {path}");
+            (200, body)
+        });
+        let pool = init_worker_pool_with_agent(NonZeroUsize::new(2).unwrap(), fast_agent()).unwrap();
+        let handle = pool.handle();
+        pool.push(srv.url("/a"));
+        // wait for the first one to land
+        while handle.completed() < 1 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // now push more while the pool is already running
+        pool.push(srv.url("/b"));
+        pool.push(srv.url("/c"));
+        let results = handle.wait();
+        pool.close();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
     }
 
     // -------------------------------------------------------------------------
@@ -601,7 +824,7 @@ mod tests {
     fn default_timeout_constant() {
         assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(5));
         let agent = default_agent();
-        // sanity: agent was built with global timeout — indirectly verified by fetch_many_default_timeout
+        // sanity: agent was built with global timeout — indirectly verified by worker_pool_default_timeout
         let _ = agent;
     }
 }

@@ -1,9 +1,15 @@
 use crate::State;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use thiserror::Error;
-use uuid::Uuid;
+use ureq::http::Method;
+
+/// Recover the data from a poisoned mutex instead of panicking.
+/// A panic in one worker must never take down or hang unrelated threads.
+pub(crate) fn recover_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub struct ScrapeJob {
     url: String,
@@ -56,25 +62,32 @@ impl Queue {
     }
 
     pub fn push(&self, job: ScrapeJob) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = recover_lock(&self.jobs);
         jobs.push_back(Some(job));
         self.avaliable.notify_one();
     }
 
     pub fn next(&self) -> Option<ScrapeJob> {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = recover_lock(&self.jobs);
         loop {
             match jobs.pop_front() {
                 Some(Some(job)) => return Some(job),
                 Some(None) => return None,
                 None => {}
             }
-            jobs = self.avaliable.wait(jobs).unwrap();
+            // Poison recovery on the condvar wait as well.
+            jobs = match self.avaliable.wait_timeout(jobs, std::time::Duration::from_secs(1)) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => {
+                    let (guard, _) = poisoned.into_inner();
+                    guard
+                }
+            };
         }
     }
 
     pub fn shutdown(&self, workers: usize) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = recover_lock(&self.jobs);
         for _ in 0..workers {
             jobs.push_back(None);
         }
@@ -82,16 +95,21 @@ impl Queue {
     }
 }
 
-pub fn worker(queue: Arc<Queue>, mut handler: impl FnMut(&mut ScrapeJob) + Send + 'static) {
+/// Runs jobs from `queue` until shutdown.
+/// `handler` must return `true` when the job succeeded (`Finished`) and
+/// `false` when it failed (`Failed`). A panic inside the handler is caught:
+/// the job is marked `Failed` and the worker keeps serving the queue instead
+/// of silently dying.
+pub fn worker(queue: Arc<Queue>, mut handler: impl FnMut(&mut ScrapeJob) -> bool + Send + 'static) {
     loop {
-        match queue.next() {
-            Some(mut job) => {
-                job.set_status(JobStatus::Running);
-                handler(&mut job);
-                job.set_status(JobStatus::Finished);
-            }
-            None => break,
-        }
+        let Some(mut job) = queue.next() else {
+            break;
+        };
+        job.set_status(JobStatus::Running);
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&mut job)))
+            .unwrap_or(false);
+        let status = if ok { JobStatus::Finished } else { JobStatus::Failed };
+        job.set_status(status);
     }
 }
 
@@ -114,22 +132,39 @@ pub enum FetchError {
     ParallelismUnavailable(#[from] std::io::Error),
 }
 
-/// Handle to a background fetch: call `fetch_many` and keep working.
-/// The result is collected via `wait()` (blocks until done) or `try_results()`.
+/// Error returned by `fetch_link` / `fetch_link_with_agent` and stored in
+/// `fetch_many` results.
+#[derive(Error, Debug)]
+pub enum FetchLinkError {
+    /// The library simply does not implement this method — say so explicitly
+    /// instead of masquerading as an HTTP 405 from the server.
+    #[error(
+        "method {0} is not implemented in scrape-rs (supported: GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)"
+    )]
+    UnsupportedMethod(Method),
+    #[error("worker thread panicked while fetching the URL")]
+    WorkerPanic,
+    #[error(transparent)]
+    Http(#[from] ureq::Error),
+}
+
+/// Handle to a background fetch: results are collected via `wait()` (blocks
+/// until done) or `try_results()`. The total number of jobs is dynamic — it
+/// grows as URLs are pushed to the owning [`WorkerPool`](crate::WorkerPool).
 pub struct FetchHandle {
     pub(crate) state: Arc<(Mutex<State>, Condvar)>,
-    pub(crate) total: usize,
 }
 
 impl FetchHandle {
     /// true if all tasks have finished
     pub fn is_finished(&self) -> bool {
         let (lock, _) = &*self.state;
-        lock.lock().unwrap().completed >= self.total
+        let state = recover_lock(lock);
+        state.completed >= state.total
     }
 
     /// Returns results if everything is ready, otherwise None (does not block)
-    pub fn try_results(&self) -> Option<Vec<Result<String, ureq::Error>>> {
+    pub fn try_results(&self) -> Option<Vec<Result<String, FetchLinkError>>> {
         if !self.is_finished() {
             return None;
         }
@@ -139,14 +174,20 @@ impl FetchHandle {
     /// How many tasks have finished already (does not block)
     pub fn completed(&self) -> usize {
         let (lock, _) = &*self.state;
-        lock.lock().unwrap().completed
+        recover_lock(lock).completed
+    }
+
+    /// How many tasks have been enqueued so far (does not block)
+    pub fn total(&self) -> usize {
+        let (lock, _) = &*self.state;
+        recover_lock(lock).total
     }
 
     /// Takes and returns the already-completed results (as they arrive).
     /// Each completed result is returned exactly once — O(1) queue drain, not O(n) scan.
-    pub fn ready_results(&self) -> Vec<(usize, Result<String, ureq::Error>)> {
+    pub fn ready_results(&self) -> Vec<(usize, Result<String, FetchLinkError>)> {
         let (lock, _) = &*self.state;
-        let mut state = lock.lock().unwrap();
+        let mut state = recover_lock(lock);
         // O(1) swap of the ready queue; no scan over `results` (O(n)) any more
         let ready_indices = std::mem::take(&mut state.ready);
         let mut out = Vec::with_capacity(ready_indices.len());
@@ -160,19 +201,22 @@ impl FetchHandle {
     }
 
     /// Blocks until all tasks finish and returns the results in original order
-    pub fn wait(&self) -> Vec<Result<String, ureq::Error>> {
+    pub fn wait(&self) -> Vec<Result<String, FetchLinkError>> {
         let (lock, cvar) = &*self.state;
-        let mut state = lock.lock().unwrap();
-        while state.completed < self.total {
-            state = cvar.wait(state).unwrap();
+        let mut state = recover_lock(lock);
+        while state.completed < state.total {
+            state = match cvar.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
         drop(state);
         self.collect()
     }
 
-    fn collect(&self) -> Vec<Result<String, ureq::Error>> {
+    fn collect(&self) -> Vec<Result<String, FetchLinkError>> {
         let (lock, _) = &*self.state;
-        let mut state = lock.lock().unwrap();
+        let mut state = recover_lock(lock);
         // Clear ready since we drain everything in order
         state.ready.clear();
         let results = std::mem::take(&mut state.results);

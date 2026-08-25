@@ -1,4 +1,18 @@
-#[cfg(test)]
+use scrape_rs::{
+    DEFAULT_TIMEOUT, default_agent, fetch_link, fetch_link_with_agent,
+    fetch_many_with_agent,
+};
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use std::thread::{self, JoinHandle};
+use ureq::{Agent, http::Method};
 
 // -------------------------------------------------------------------------
 // Test HTTP server (std only, no external crates)

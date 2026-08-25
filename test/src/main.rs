@@ -1,20 +1,6 @@
+use scrape_rs::fetch_many;
 use scrape_rs::parsers::{select_all, select_first, select_html};
-use scrape_rs::{
-    DEFAULT_TIMEOUT, default_agent, fetch_link, fetch_link_with_agent, fetch_many,
-    fetch_many_with_agent,
-};
-
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
 use std::num::NonZeroUsize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
-use std::thread::{self, JoinHandle};
-use ureq::Agent;
 
 #[derive(Debug)]
 #[allow(unused)]
@@ -35,32 +21,7 @@ fn parse_quotes(html: &str) -> Vec<Quote> {
         .collect()
 }
 
-include!("tests.rs");
-
 fn main() {
-    // println!("Multithread parsing\n\n\n\n");
-    //
-    // let mut threads = Vec::new();
-    // for i in 1..11{
-    //     let handle = spawn(move || {
-    //         fetch_link(format!("https://quotes.toscrape.com/page/{}", i).as_str(), Method::GET, None, None)
-    //
-    //     });
-    //     threads.push(handle);
-    // }
-    //
-    //
-    // let mut results = Vec::new();
-    // for handle in threads {
-    //     results.push(parse_quotes(handle.join().unwrap().unwrap().to_string().as_str()));
-    // }
-    //
-    // for page in results {
-    //     for quote in page {
-    //         println!("{:?}", quote);
-    //     }
-    // }
-
     let urls: Vec<String> = (1..=10)
         .map(|i| format!("https://quotes.toscrape.com/page/{}", i))
         .collect();
@@ -89,4 +50,10 @@ fn main() {
         // Avoid wasting CPU — short sleep between polls
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    include!("tests.rs");
 }

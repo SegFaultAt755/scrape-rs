@@ -1,3 +1,7 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use scrape_rs::fetch_many;
 use scrape_rs::parsers::{select_all, select_first, select_html};
 use std::num::NonZeroUsize;
@@ -22,6 +26,9 @@ fn parse_quotes(html: &str) -> Vec<Quote> {
 }
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let urls: Vec<String> = (1..=10)
         .map(|i| format!("https://quotes.toscrape.com/page/{}", i))
         .collect();

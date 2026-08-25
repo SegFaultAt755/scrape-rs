@@ -8,4 +8,8 @@ publish = false
 ureq = { version = "3.4.0", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 scrape-rs = { path = "../scrape-rs" }
+dhat = "0.3.3"
+
+[features]
+dhat-heap = []
 

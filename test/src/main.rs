@@ -2,8 +2,12 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use scrape_rs::fetch_many;
-use scrape_rs::parsers::{select_all, select_first, select_html};
+use scraper::{Html, Selector};
 use std::num::NonZeroUsize;
 
 #[derive(Debug)]
@@ -15,12 +19,29 @@ struct Quote {
 }
 
 fn parse_quotes(html: &str) -> Vec<Quote> {
-    select_html(html, ".quote")
-        .into_iter()
+    let document = Html::parse_document(html);
+    let quote_selector = Selector::parse(".quote").unwrap();
+    let text_selector = Selector::parse(".text").unwrap();
+    let author_selector = Selector::parse(".author").unwrap();
+    let tag_selector = Selector::parse(".tag").unwrap();
+
+    document
+        .select(&quote_selector)
         .map(|quote| Quote {
-            text: select_first(&quote, ".text").unwrap_or_default(),
-            author: select_first(&quote, ".author").unwrap_or_default(),
-            tags: select_all(&quote, ".tag"),
+            text: quote
+                .select(&text_selector)
+                .next()
+                .map(|element| element.text().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+            author: quote
+                .select(&author_selector)
+                .next()
+                .map(|element| element.text().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default(),
+            tags: quote
+                .select(&tag_selector)
+                .map(|element| element.text().collect::<Vec<_>>().join(" "))
+                .collect(),
         })
         .collect()
 }

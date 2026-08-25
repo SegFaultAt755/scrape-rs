@@ -1,9 +1,23 @@
-use scrape_rs::fetch_many;
 use scrape_rs::parsers::{select_all, select_first, select_html};
+use scrape_rs::{
+    DEFAULT_TIMEOUT, default_agent, fetch_link, fetch_link_with_agent, fetch_many,
+    fetch_many_with_agent,
+};
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 use std::num::NonZeroUsize;
-use std::thread::sleep;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use std::thread::{self, JoinHandle};
+use ureq::Agent;
 
 #[derive(Debug)]
+#[allow(unused)]
 struct Quote {
     text: String,
     author: String,
@@ -20,6 +34,8 @@ fn parse_quotes(html: &str) -> Vec<Quote> {
         })
         .collect()
 }
+
+include!("tests.rs");
 
 fn main() {
     // println!("Multithread parsing\n\n\n\n");

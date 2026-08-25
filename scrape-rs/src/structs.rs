@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
-use uuid::Uuid;
 
 pub struct ScrapeJob {
     url: String,
@@ -42,6 +41,7 @@ impl ScrapeJob {
     }
 }
 
+#[derive(Default)]
 pub struct Queue {
     jobs: Mutex<VecDeque<Option<ScrapeJob>>>,
     avaliable: Condvar,
@@ -83,15 +83,10 @@ impl Queue {
 }
 
 pub fn worker(queue: Arc<Queue>, mut handler: impl FnMut(&mut ScrapeJob) + Send + 'static) {
-    loop {
-        match queue.next() {
-            Some(mut job) => {
-                job.set_status(JobStatus::Running);
-                handler(&mut job);
-                job.set_status(JobStatus::Finished);
-            }
-            None => break,
-        }
+    while let Some(mut job) = queue.next() {
+        job.set_status(JobStatus::Running);
+        handler(&mut job);
+        job.set_status(JobStatus::Finished);
     }
 }
 

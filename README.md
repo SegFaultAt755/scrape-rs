@@ -18,7 +18,7 @@
 
 </div>
 
-- **Concurrent fetching** — `fetch_many` fetches a list of URLs on a configurable number of worker threads
+- **Worker pool** — `init_worker_pool` spins up a configurable number of worker threads and returns a queue you can push URLs into at any time, plus a `FetchHandle` to read results
 - **Incremental results** — process responses as soon as they arrive via `FetchHandle::ready_results`, or wait for everything with `wait()`
 - **Single requests** — `fetch_link` for one-off GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS requests with optional body and content type
 - **HTML parsing helpers** — `select_html`, `select_first`, and `select_all` for querying HTML with CSS selectors
@@ -47,13 +47,19 @@ scrape-rs = { path = "scrape-rs" }
 
 ```rust
 use std::num::NonZeroUsize;
-use scrape_rs::{fetch_many, parsers::{select_first, select_html}};
+use scrape_rs::{init_worker_pool, parsers::{select_first, select_html}};
 
 let urls: Vec<String> = (1..=10)
     .map(|i| format!("https://quotes.toscrape.com/page/{i}"))
     .collect();
 
-let handle = fetch_many(urls, NonZeroUsize::new(4).unwrap()).unwrap();
+let pool = init_worker_pool(NonZeroUsize::new(4).unwrap()).unwrap();
+let handle = pool.handle();
+
+for url in urls {
+    pool.push(url);
+}
+pool.close();
 
 loop {
     // Handle results as they complete

@@ -1,13 +1,5 @@
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
-#[cfg(not(feature = "dhat-heap"))]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-use scrape_rs::fetch_many;
-use scraper::{Html, Selector};
+use scrape_rs::init_worker_pool;
+use scrape_rs::parsers::{select_all, select_first, select_html};
 use std::num::NonZeroUsize;
 
 #[derive(Debug)]
@@ -47,15 +39,19 @@ fn parse_quotes(html: &str) -> Vec<Quote> {
 }
 
 fn main() {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
-    let urls: Vec<String> = (1..=10)
+    let urls: Vec<String> = (1..=100)
         .map(|i| format!("https://quotes.toscrape.com/page/{}", i))
         .collect();
 
-    let fetch_handle = fetch_many(urls, NonZeroUsize::new(1).unwrap()).unwrap();
+    let pool = init_worker_pool(NonZeroUsize::new(1).unwrap()).unwrap();
+    let fetch_handle = pool.handle();
     println!("threads started");
+
+    for url in urls {
+        pool.push(url);
+
+    }
+    pool.close(); // Signal that workers can finish, and that there will not be any new task.
 
     // Keep polling for partial results and parse them as soon as they arrive
     loop {
